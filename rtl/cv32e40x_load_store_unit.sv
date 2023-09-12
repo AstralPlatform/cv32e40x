@@ -77,6 +77,9 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
   output align_status_e lsu_align_status_1_o,   // Alignment status (for atomics), WB timing
   output lsu_atomic_e lsu_atomic_1_o,           // Is there an atomic in WB, and of which type.
 
+  // Privilege mode
+  input              privlvl_t priv_lvl_lsu_i,
+
   // Handshakes
   input  logic        valid_0_i,                // Handshakes for first LSU stage (EX)
   output logic        ready_0_o,                // LSU ready for new data in EX stage
@@ -146,7 +149,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
   obi_data_req_t  filter_trans;
   logic           filter_resp_valid;
   obi_data_resp_t filter_resp;
-  logic [1:0]     filter_err;
 
   // Transaction request (from cv32e40x_write_buffer to cv32e40x_data_obi_interface)
   logic           bus_trans_valid;
@@ -179,8 +181,9 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
   logic           split_q;              // Currently performing the second address phase of a split misaligned load/store
                                         // Note that in the presence of a write buffer, split_q will align with acceptance of the second
                                         // transfer by the write buffer. This may not align with the OBI address phase.
-  logic           misaligned_halfword;  // Halfword is not naturally aligned, but no split is needed
+  logic           nonsplit_misaligned_halfword;  // Halfword is not naturally aligned, but no split is needed
   logic           misaligned_access;    // Access is not naturally aligned
+  logic           modified_access;      // Access is modified, e.g. non-naturally aligned access needs two bus transactions
 
   logic           filter_resp_busy;     // Response filter busy
 
@@ -211,7 +214,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
     trans.we    = id_ex_pipe_i.lsu_we;
     trans.size  = id_ex_pipe_i.lsu_size;
     trans.wdata = id_ex_pipe_i.operand_c;
-    trans.mode  = PRIV_LVL_M; // Machine mode
+    trans.mode  = priv_lvl_lsu_i;
     trans.dbg   = ctrl_fsm_i.debug_mode;
 
     trans.atop  = id_ex_pipe_i.lsu_atop;
@@ -452,9 +455,18 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
     end
   endgenerate
 
-  // misaligned_access is high for both transfers of a misaligned transfer
-  // TODO: Give MPU a separate modified_access_i input
-  assign misaligned_access = split_q || lsu_split_0_o || misaligned_halfword || (xif_req && (xif_mem_if.mem_req.attr[0] || xif_mem_if.mem_req.attr[1]));
+  // Misaligned accesses occur for:
+  //
+  // - Both phases of a split misaligned access
+  // - For a misaligned halfword that does not require a split
+  // - When the XIF does a misaligned access
+  assign misaligned_access = split_q || lsu_split_0_o || nonsplit_misaligned_halfword || (xif_req && xif_mem_if.mem_req.attr[1]);
+
+  // Modified acccesses occur for:
+  //
+  // - Both phases of a split misaligned access
+  // - When the XIF does a modified access
+  assign modified_access = split_q || lsu_split_0_o || (xif_req && (xif_mem_if.mem_req.attr[0]));
 
   // Check for misaligned accesses that need a second memory access
   // If one is detected, this is signaled with lsu_split_0_o.
@@ -465,7 +477,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
   always_comb
   begin
     lsu_split_0_o = 1'b0;
-    misaligned_halfword = 1'b0;
+    nonsplit_misaligned_halfword = 1'b0;
     if (valid_0_i && !xif_req && !split_q)
     begin
       case (trans.size)
@@ -479,7 +491,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
           if (trans.addr[1:0] == 2'b11)
             lsu_split_0_o = 1'b1;
           if (trans.addr[0] != 1'b0)
-            misaligned_halfword = 1'b1;
+            nonsplit_misaligned_halfword = 1'b1;
         end
         default:;
       endcase // case (trans.size)
@@ -516,8 +528,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
       wpt_trans.memtype = 2'b00;                           // Memory type is assigned in MPU
     end else begin
       // For last phase of misaligned/split transfer the address needs to be word aligned (as LSB of be will be set)
-      // todo: As part of the fix for https://github.com/openhwgroup/cv32e40x/issues/388 the following should be used as well:
-      // wpt_trans.addr   = split_q ? {trans.addr[31:2], 2'b00} + 'h4 : trans.addr;
       wpt_trans.addr    = trans.atop[5] ? trans.addr : (split_q ? {trans.addr[31:2], 2'b00} + 'h4 : trans.addr);
       wpt_trans.we      = trans.we;
       wpt_trans.be      = be;
@@ -694,8 +704,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
 
   // Validate bus_error on rvalid from the bus (WB stage)
   // For bufferable transfers, this can happen many cycles after the pipeline control logic has seen the filtered resp_valid
-  // Todo: This bypasses the MPU, could be merged with mpu_status_e and passed through the MPU instead
-  assign lsu_err_1_o = xif_res_q ? '0 : filter_err;
+  assign lsu_err_1_o = xif_res_q ? '0 : resp.bus_resp.err;
 
   //////////////////////////////////////////////////////////////////////////////
   // WPT
@@ -797,6 +806,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
     .rst_n                ( rst_n              ),
     .atomic_access_i      ( mpu_trans_atomic   ),
     .misaligned_access_i  ( misaligned_access  ),
+    .modified_access_i    ( modified_access    ),
 
     .core_one_txn_pend_n  ( cnt_is_one_next    ),
     .core_mpu_err_wait_i  ( consumer_resp_wait ),
@@ -871,7 +881,6 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
        .trans_i      ( filter_trans       ),
        .resp_valid_o ( filter_resp_valid  ),
        .resp_o       ( filter_resp        ),
-       .err_o        ( filter_err         ),
 
        .valid_o      ( buffer_trans_valid ),
        .ready_i      ( buffer_trans_ready ),
@@ -941,7 +950,7 @@ module cv32e40x_load_store_unit import cv32e40x_pkg::*;
       // XIF memory result
       assign xif_mem_result_if.mem_result.id    = xif_id_q;
       assign xif_mem_result_if.mem_result.rdata = rdata_ext;
-      assign xif_mem_result_if.mem_result.err   = filter_err[0]; // forward bus errors to coprocessor
+      assign xif_mem_result_if.mem_result.err   = resp.bus_resp.err[0]; // forward bus errors to coprocessor
       assign xif_mem_result_if.mem_result.dbg   = '0;            // TODO:XIF forward debug triggers
     end else begin : no_x_ext
       assign xif_mem_if.mem_resp.exc            = '0;

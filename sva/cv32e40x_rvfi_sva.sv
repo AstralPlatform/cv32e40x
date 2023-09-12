@@ -162,7 +162,7 @@ if (DEBUG) begin
   // Helper signal, indicating debug cause
   // Special case for debug entry from debug mode caused by EBREAK as it is not captured by debug_cause_i
   logic [2:0] debug_cause_int;
-  assign debug_cause_int = ebreak_in_wb_i ? 3'h1 : ctrl_fsm_i.debug_cause;
+  assign debug_cause_int = (ctrl_fsm_i.debug_mode && ebreak_in_wb_i) ? 3'h1 : ctrl_fsm_i.debug_cause;
 
   // Check that dbg_ack results in RVFI capturing a debug_cause
   // Ideally, we should assert that every dbg_ack eventually leads to rvfi_dbg,
@@ -391,9 +391,6 @@ end
 
     else `uvm_error("rvfi", "No rvfi_valid or rvfi_trap for etrigger.")
 
-  /* TODO: Add back in.
-     Currently, the alignment buffer can interpret pointers as compressed instructions and pass on two "instructions" from the IF stage.
-     cv32e40x_rvfi_instr_obi will not be in sync with the alignment buffer until this is fixed. See https://github.com/openhwgroup/cv32e40x/issues/704
 
   // Check that cv32e40x_rvfi_instr_obi tracks alignment buffer
   a_rvfi_instr_obi_addr:
@@ -434,8 +431,9 @@ end
                      prefetch_valid_if_i && prefetch_ready_if_i && !prefetch_compressed_if_i && (prefetch_addr_if_i[1:0] != 2'b00 && (obi_instr_if.resp_payload.mpu_status == MPU_OK)) |->
                      obi_instr_fifo_q[obi_instr_rptr_q].req_payload.prot == obi_instr_fifo_q[obi_instr_rptr_q_inc].req_payload.prot)
       else `uvm_error("rvfi", "rvfi_instr_obi prot not the same for split transfers")
-  */
 
+
+  // The following assertions and support logic check that memory transfers reported on rvfi_mem are consistent with LSU OBI transfers
 
   localparam int unsigned OBI_FIFO_SIZE = 32; // FIFO needs to be able to hold at least 2*13 memory transfers (because Zc can cause 13 transfers, and these can be split misaligned)
   localparam int unsigned MAX_NUM_MEMOP = 13; // This must be set to the maximum number of memory operations per retired instruction. If set too high it will result in unreachable covers
@@ -455,9 +453,9 @@ end
     } rvfi_mem_t;
 
     // Return number of memory operations based on rvfi_mem_rmaks/wmask
-    function automatic int unsigned get_num_memop(bit [4*NMEM-1:0] rvfi_mem_mask);
+    function automatic bit [$clog2(NMEM)-1:0] get_num_memop(bit [4*NMEM-1:0] rvfi_mem_mask);
 
-      int unsigned      num_memop = 0;
+      bit [$clog2(NMEM)-1:0] num_memop = 0;
 
       for (int i=0; i<NMEM; i++) begin
         if(|rvfi_mem_mask[i*4 +: 4]) begin
@@ -501,7 +499,7 @@ end
     bit [$clog2(OBI_FIFO_SIZE)-1:0] wr_req_ptr, wr_resp_ptr;
 
     // Indicate number of memory operations per instruction
-    int unsigned                    num_memop;
+    bit [$clog2(NMEM):0]                       num_memop;
 
     rvfi_mem_t rvfi_mem, rvfi_mem_dly, rvfi_mem_exp;
 
@@ -538,7 +536,7 @@ end
       end else begin
         if(m_c_obi_data_if.s_req.req && !m_c_obi_data_if.s_gnt.gnt) begin
           if (obi_gnt_dly_cnt <= MAX_GNT_DLY) begin
-            obi_gnt_dly_cnt <= obi_gnt_dly_cnt + 1;
+            obi_gnt_dly_cnt <= obi_gnt_dly_cnt + 1'b1;
           end
         end
         else begin
@@ -579,26 +577,26 @@ end
       // Populate OBI req FIFO
       if (m_c_obi_data_if.s_req.req && m_c_obi_data_if.s_gnt.gnt) begin
         data_obi_req_fifo[wr_req_ptr] <= m_c_obi_data_if.req_payload;
-        wr_req_ptr <= wr_req_ptr + 1;
+        wr_req_ptr <= wr_req_ptr + 1'b1;
       end
 
       // Populate OBI resp FIFO
       if (m_c_obi_data_if.s_rvalid.rvalid) begin
         data_obi_resp_fifo[wr_resp_ptr] <= m_c_obi_data_if.resp_payload;
-        wr_resp_ptr <= wr_resp_ptr + 1;
+        wr_resp_ptr <= wr_resp_ptr + 1'b1;
       end
     end
   end
 
   // Pointer to next OBI transfer. Used for split misaligned
-  assign rd_ptr_inc = rd_ptr + 1;
+  assign rd_ptr_inc = rd_ptr + 1'b1;
 
   // Extract number of memory operation in retired instruction
   assign num_memop = get_num_memop(rvfi_mem_dly.wmask) + get_num_memop(rvfi_mem_dly.rmask);
 
   // Assumption here is that if the first transfer is a split, the following ones will be as well.
   // The reasoning is that Zc push/pop will always do word read/writes, meaning that if the first is split, so will the rest
-  assign split_transfer = split_xfer(rvfi_mem_dly.addr[31:0], rvfi_mem_dly.wmask[3:0] | rvfi_mem_dly.rmask[3:0]);
+  assign split_transfer = split_xfer(rvfi_mem_dly.addr[1:0], rvfi_mem_dly.wmask[3:0] | rvfi_mem_dly.rmask[3:0]);
 
   // Increment read pointer based on memory operations in the retired instruction
   always_comb begin
@@ -606,14 +604,21 @@ end
 
     if (|rvfi_mem_xfer) begin
       if(split_transfer) begin
-        // For split transferse, we'll consume 2 OBI tranfers per memory operation
-        rd_ptr_n = rd_ptr + 2*num_memop;
+        // For split transfers, we'll consume 2 OBI tranfers per memory operation
+        rd_ptr_n = rd_ptr + ($clog2(OBI_FIFO_SIZE))'(2*num_memop);
       end
       else begin
-        rd_ptr_n = rd_ptr + 1*num_memop;
+        rd_ptr_n = rd_ptr + ($clog2(OBI_FIFO_SIZE))'(1*num_memop);
       end
     end
   end
+
+  // FIFO depth and assertions are designed to support up to MAX_NUM_MEMOP memory operations per retired instruction.
+  // Make sure this assumption holds
+  a_rvfi_mem_max_num_memop:
+    assert property (@(posedge clk_i) disable iff (!rst_ni)
+                     |rvfi_mem_xfer |-> num_memop <= MAX_NUM_MEMOP)
+        else `uvm_error("rvfi", "Memory operations > MAX_NUM_MEMOP. Potential overflow in SVA support logic.")
 
   genvar i_memop;
   generate
@@ -630,7 +635,7 @@ end
       bit [31:0] split_2nd_wdata;
       bit [31:0] split_1st_rdata;
       bit [31:0] split_2nd_rdata;
-      bit [1:0]  split_2nd_shift;
+      bit [2:0]  split_2nd_shift;
 
       bit [$clog2(OBI_FIFO_SIZE)-1:0] rd_ptr_memop, rd_ptr_memop_inc;
 
@@ -662,10 +667,10 @@ end
           if(split_transfer) begin
             // Split misaligned transfer(s)
 
-            rd_ptr_memop      = rd_ptr + 2*i_memop; // Split transfers are reported in one memory operation on rvfi_mem, but results in 2 OBI transfers.
-            rd_ptr_memop_inc  = rd_ptr_memop + 1;
+            rd_ptr_memop      = rd_ptr + ($clog2(OBI_FIFO_SIZE))'(2*i_memop); // Split transfers are reported in one memory operation on rvfi_mem, but results in 2 OBI transfers.
+            rd_ptr_memop_inc  = rd_ptr_memop + 1'b1;
 
-            split_2nd_shift   = 4 - data_obi_req_fifo[rd_ptr_memop].addr[1:0];
+            split_2nd_shift   = 3'h4 - data_obi_req_fifo[rd_ptr_memop].addr[1:0];
 
             exp_rvfi_mem_mask = (data_obi_req_fifo[rd_ptr_memop].be     >> data_obi_req_fifo[rd_ptr_memop].addr[1:0]) |
                                 (data_obi_req_fifo[rd_ptr_memop_inc].be << split_2nd_shift);
@@ -686,7 +691,7 @@ end
           end
           else begin
 
-            rd_ptr_memop                           = rd_ptr + i_memop;
+            rd_ptr_memop                           = rd_ptr + ($clog2(OBI_FIFO_SIZE))'(i_memop);
 
             exp_rvfi_mem_mask                      = data_obi_req_fifo[rd_ptr_memop].be >> data_obi_req_fifo[rd_ptr_memop].addr[1:0];
 

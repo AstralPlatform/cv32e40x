@@ -40,7 +40,7 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   parameter int unsigned CLIC_ID_WIDTH        = 5,
   parameter int unsigned NUM_MHPMCOUNTERS     = 1,
   parameter bit          DEBUG                = 1,
-  parameter int          DBG_NUM_TRIGGERS     = 1, // todo: implement support for DBG_NUM_TRIGGERS != 1
+  parameter int          DBG_NUM_TRIGGERS     = 1,
   parameter int unsigned MTVT_ADDR_WIDTH      = 26
 )
 (
@@ -71,6 +71,8 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   output logic [MTVT_ADDR_WIDTH-1:0]    mtvt_addr_o,
 
   output privlvl_t                      priv_lvl_o,
+  output privlvlctrl_t                  priv_lvl_if_ctrl_o,
+  output privlvl_t                      priv_lvl_lsu_o,
 
   // ID/EX pipeline
   input id_ex_pipe_t                    id_ex_pipe_i,
@@ -85,6 +87,7 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   // To controller_bypass
   output logic                          csr_counter_read_o,
   output logic                          csr_mnxti_read_o,
+  output csr_hz_t                       csr_hz_o,
 
   // Interface to CSRs (SRAM like)
   output logic [31:0]                   csr_rdata_o,
@@ -215,9 +218,6 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   logic [31:0]                  mintthresh_q, mintthresh_n, mintthresh_rdata;
   logic                         mintthresh_we;
 
-  logic [31:0]                  mscratchcsw_n, mscratchcsw_rdata;
-  logic                         mscratchcsw_we;
-
   logic [31:0]                  mscratchcswl_n, mscratchcswl_rdata;
   logic                         mscratchcswl_we;
 
@@ -245,9 +245,8 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   logic [31:0]                  mtval_n, mtval_rdata;                           // No CSR module instance
   logic                         mtval_we;                                       // Not used in RTL (used by RVFI)
 
-  privlvl_t                     priv_lvl_n, priv_lvl_q, priv_lvl_rdata; // todo: Use the priv_* signals as much as possible as in the 40S
+  privlvl_t                     priv_lvl_n, priv_lvl_q, priv_lvl_rdata;
   logic                         priv_lvl_we;
-  logic [1:0]                   priv_lvl_q_int;
 
   // Detect JVT writes (requires pipeline flush)
   logic                         csr_wr_in_wb;
@@ -276,9 +275,21 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
   logic [31:0]                  mhpmcounter_write_increment;                    // Write increment of mhpmcounter_q
 
   // Signal used for RVFI to set rmask, not used internally
-  logic                         mscratchcsw_in_wb;
   logic                         mscratchcswl_in_wb;
   logic                         mnxti_in_wb;
+
+  // Local padded version of mnxti_irq_id_i
+  logic [32-MTVT_ADDR_WIDTH-2-1:0] mnxti_irq_id;
+
+  // Pad mnxti_irq_i with zeroes if CLIC_ID_WIDTH is not 4 or more.
+  generate
+    if (CLIC_ID_WIDTH < 4) begin : mnxti_irq_id_lt4
+      assign mnxti_irq_id = {{(4-CLIC_ID_WIDTH){1'b0}}, mnxti_irq_id_i};
+    end
+    else begin: mnxti_irq_id_ge4
+      assign mnxti_irq_id = mnxti_irq_id_i;
+    end
+  endgenerate
 
   // Local instr_valid for write portion (WB)
   // Not factoring in ctrl_fsm_i.halt_limited_wb. This signal is only set during SLEEP mode, and while in SLEEP
@@ -327,9 +338,11 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
 
   always_comb
   begin
-    illegal_csr_read   = 1'b0;
-    csr_counter_read_o = 1'b0;
-    csr_mnxti_read_o   = 1'b0;
+    illegal_csr_read    = 1'b0;
+    csr_counter_read_o  = 1'b0;
+    csr_mnxti_read_o    = 1'b0;
+    csr_hz_o.impl_re_ex = 1'b0;
+    csr_hz_o.impl_wr_ex = 1'b0;
 
     case (csr_raddr)
       // jvt: Jump vector table
@@ -343,7 +356,12 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
       end
 
       // mstatus
-      CSR_MSTATUS: csr_rdata_int = mstatus_rdata;
+      CSR_MSTATUS: begin
+        csr_rdata_int = mstatus_rdata;
+        if (CLIC) begin
+          csr_hz_o.impl_wr_ex = 1'b1; // Writes to mcause as well
+        end
+      end
 
       // misa
       CSR_MISA: csr_rdata_int = misa_rdata;
@@ -388,7 +406,12 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
       CSR_MEPC: csr_rdata_int = mepc_rdata;
 
       // mcause: exception cause
-      CSR_MCAUSE: csr_rdata_int = mcause_rdata;
+      CSR_MCAUSE: begin
+        csr_rdata_int = mcause_rdata;
+        if (CLIC) begin
+          csr_hz_o.impl_wr_ex = 1'b1; // Writes to mstatus as well
+        end
+      end
 
       // mtval
       CSR_MTVAL: csr_rdata_int = mtval_rdata;
@@ -403,6 +426,8 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
           // For mnxti, this is actually mstatus. The value written back to the GPR will be the address of
           // the function pointer to the interrupt handler. This is muxed in the WB stage.
           csr_rdata_int = mstatus_rdata;
+          csr_hz_o.impl_re_ex = 1'b1; // Reads mstatus
+          csr_hz_o.impl_wr_ex = 1'b1; // Writes mstatus, mcause and mintstatus
           csr_mnxti_read_o = 1'b1;
         end else begin
           csr_rdata_int    = '0;
@@ -430,27 +455,6 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
         end
       end
 
-      // mscratchcsw: Scratch Swap for Multiple Privilege Modes
-      CSR_MSCRATCHCSW: begin
-        if (CLIC) begin
-          // CLIC spec 13.2
-          // Depending on mstatus.MPP, we return either mscratch_rdata or rs1 to rd.
-          // Safe to use mstatus_rdata here (EX timing), as there is a generic stall of the ID stage
-          // whenever a CSR instruction follows another CSR instruction. Alternative implementation using
-          // a local forward of mstatus_rdata is identical (SEC).
-          if (mstatus_rdata.mpp != PRIV_LVL_M) begin
-            // Return mscratch for writing to GPR
-            csr_rdata_int = mscratch_rdata;
-          end else begin
-            // return rs1 for writing to GPR
-            csr_rdata_int = id_ex_pipe_i.alu_operand_a;
-          end
-        end else begin
-          csr_rdata_int    = '0;
-          illegal_csr_read = 1'b1;
-        end
-      end
-
       // mscratchcswl: Scratch Swap for Interrupt Levels
       CSR_MSCRATCHCSWL: begin
         if (CLIC) begin
@@ -459,6 +463,8 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
           // Safe to use mcause_rdata and mintstatus_rdata here (EX timing), as there is a generic stall of the ID stage
           // whenever a CSR instruction follows another CSR instruction. Alternative implementation using
           // a local forward of mcause_rdata and mintstatus_rdata is identical (SEC).
+          csr_hz_o.impl_re_ex = 1'b1; // Reads mscratch, mcause and mintstatus
+          csr_hz_o.impl_wr_ex = 1'b1; // Writes mscratch
           if ((mcause_rdata.mpil == '0) != (mintstatus_rdata.mil == 0)) begin
             // Return mscratch for writing to GPR
             csr_rdata_int = mscratch_rdata;
@@ -475,6 +481,7 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
       CSR_TSELECT: begin
         if (DBG_NUM_TRIGGERS > 0) begin
           csr_rdata_int = tselect_rdata;
+          csr_hz_o.impl_wr_ex = 1'b1; // Changing tselect may change tdata1 and tdata2 as well
         end else begin
           csr_rdata_int = '0;
           illegal_csr_read = 1'b1;
@@ -717,10 +724,7 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
       mintthresh_n             = csr_next_value(csr_wdata_int, CSR_MINTTHRESH_MASK, MINTTHRESH_RESET_VAL);
       mintthresh_we            = 1'b0;
 
-      mscratchcsw_n            = mscratch_n; // mscratchcsw operates conditionally on mscratch
-      mscratchcsw_we           = 1'b0;
-
-      mscratchcswl_n           = mscratch_n; // mscratchcsw operates conditionally on mscratch
+      mscratchcswl_n           = mscratch_n; // mscratchcswl operates conditionally on mscratch
       mscratchcswl_we          = 1'b0;
 
       mie_n                    = '0;
@@ -761,9 +765,6 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
 
       mintthresh_n             = '0;
       mintthresh_we            = 1'b0;
-
-      mscratchcsw_n            = '0;
-      mscratchcsw_we           = 1'b0;
 
       mscratchcswl_n           = '0;
       mscratchcswl_we          = 1'b0;
@@ -906,17 +907,6 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
           end
         end
 
-        CSR_MSCRATCHCSW: begin
-          if (CLIC) begin
-            // mscratchcsw operates on mscratch
-            // Writing only when mstatus.mpp != PRIV_LVL_M
-            if (mstatus_rdata.mpp != PRIV_LVL_M) begin
-              mscratchcsw_we = 1'b1;
-              mscratch_we    = 1'b1;
-            end
-          end
-        end
-
         CSR_MSCRATCHCSWL: begin
           if (CLIC) begin
             // mscratchcswl operates on mscratch
@@ -1035,7 +1025,7 @@ module cv32e40x_cs_registers import cv32e40x_pkg::*;
                                     cause     : ctrl_fsm_i.debug_cause,
                                     default   : 'd0
                                   };
-dcsr_we        = 1'b1;
+          dcsr_we        = 1'b1;
 
           dpc_n          = ctrl_fsm_i.pipe_pc;
           dpc_we         = 1'b1;
@@ -1117,11 +1107,6 @@ dcsr_we        = 1'b1;
             mintthresh_n  = 32'h00000000;
             mintthresh_we = 1'b1;
           end
-
-          if (ctrl_fsm_i.csr_restore_mret_ptr) begin
-            // Clear mcause.minhv if the mret also caused a successful CLIC pointer fetch
-            mcause_n.minhv = 1'b0;
-          end
         end
       end //ctrl_fsm_i.csr_restore_mret
 
@@ -1145,22 +1130,6 @@ dcsr_we        = 1'b1;
 
       end //ctrl_fsm_i.csr_restore_dret
 
-      // Clear mcause.minhv on successful CLIC pointer fetches
-      // This only happens for CLIC pointer that did not originate from an mret.
-      // In the case of mret restarting CLIC pointer fetches, minhv is cleared while
-      // ctrl_fsm_i.csr_restore_mret_ptr is asserted.
-      ctrl_fsm_i.csr_clear_minhv: begin
-        if (CLIC) begin
-          // Keep mcause values, only clear minhv bit.
-          mcause_n = mcause_rdata;
-          mcause_n.minhv = 1'b0;
-          mcause_we = 1'b1;
-
-          // Not really needed, but allows for asserting mstatus_we == mcause_we to check aliasing formally
-          mstatus_n  = mstatus_rdata;
-          mstatus_we = 1'b1;
-        end
-      end
       default:;
     endcase
 
@@ -1486,12 +1455,7 @@ dcsr_we        = 1'b1;
   // mnxti_rdata breaks the regular convension for CSRs. The read data used for read-modify-write is the mstatus_rdata,
   // while the value read and written back to the GPR is a pointer address if an interrupt is pending, or zero
   // if no interrupt is pending.
-  assign mnxti_rdata        = mnxti_irq_pending_i ? {mtvt_addr_o, mnxti_irq_id_i, 2'b00} : 32'h00000000;
-
-  // mscratchcsw_rdata breaks the regular convension for CSRs. Read data depends on mstatus.mpp
-  // mscratch_rdata is returned if mstatus.mpp differs from PRIV_LVL_M, otherwise rs1 is returned.
-  // This signal is only used by RVFI, and has WB timing (rs1 comes from ex_wb_pipe_i.csr_wdata, flopped version of id_ex_pipe.alu_operand_a)
-  assign mscratchcsw_rdata  = (mstatus_rdata.mpp != PRIV_LVL_M) ? mscratch_rdata : ex_wb_pipe_i.csr_wdata;
+  assign mnxti_rdata        = mnxti_irq_pending_i ? {mtvt_addr_o, mnxti_irq_id, 2'b00} : 32'h00000000;
 
   // mscratchcswl_rdata breaks the regular convension for CSrs. Read data depend on mcause.pil and mintstatus.mil.
   // This signal is only used by RVFI, and has WB timing (rs1 comes from ex_wb_pipe_i.csr_wdata, flopped version of id_ex_pipe.alu_operand_a)
@@ -1507,7 +1471,12 @@ dcsr_we        = 1'b1;
   assign mhartid_rdata      = mhartid_i;
   assign mconfigptr_rdata   = 32'h0;
 
+  // Only machine mode is supported
   assign priv_lvl_rdata     = PRIV_LVL_M;
+  assign priv_lvl_q         = PRIV_LVL_M;
+  assign priv_lvl_lsu_o     = PRIV_LVL_M;
+  assign priv_lvl_if_ctrl_o.priv_lvl     = PRIV_LVL_M;
+  assign priv_lvl_if_ctrl_o.priv_lvl_set = 1'b0;
 
   // dcsr_rdata factors in the flop outputs and the nmip bit from the controller
   assign dcsr_rdata = DEBUG ? {dcsr_q[31:4], ctrl_fsm_i.pending_nmi, dcsr_q[2:0]} : 32'h0;
@@ -1540,6 +1509,22 @@ dcsr_we        = 1'b1;
     end
   endgenerate
 
+  // Set signals for explicit CSR hazard detection
+  // Conservative expl_re_ex, based on flopped instr_valid and not the local version factoring in halt/kill.
+  // May cause a false positive while EX stage is either halted or killed. When halted the instruction in EX would
+  // not propagate at all, regardless of any hazard raised. When killed the stage is flushed and there is no penalty
+  // added from the conservative stall.
+  // Avoiding halt/kill also avoids combinatorial lopps via the controller_fsm as a CSR hazard may lead to halt_ex being asserted.
+  assign csr_hz_o.expl_re_ex = id_ex_pipe_i.csr_en && id_ex_pipe_i.instr_valid;
+  assign csr_hz_o.expl_raddr_ex = csr_raddr;
+
+  // Conservative expl_we_wb, based on flopped instr_valid and not the local version factoring in halt/kill.
+  // May cause false positives when a CSR instruction in WB is halted or killed. When WB is halted, the backpressure of the pipeline
+  // causes no instructions to propagate down the pipeline. Thus a false positive will not give any cycle penalties.
+  // When WB is killed, the full pipeline is also killed and any stalls due to a false positive will not have any effect.
+  // Same remark about combinatorial loops as for the expl_re_ex above.
+  assign csr_hz_o.expl_we_wb = ex_wb_pipe_i.csr_en && ex_wb_pipe_i.instr_valid && (csr_op != CSR_OP_READ);
+  assign csr_hz_o.expl_waddr_wb = csr_waddr;
   ////////////////////////////////////////////////////////////////////////
   //
   // CSR outputs
@@ -1899,16 +1884,14 @@ dcsr_we        = 1'b1;
   assign mcountinhibit_rdata = mcountinhibit_q;
 
   // Assign values used for setting rmask in RVFI
-  assign mscratchcsw_in_wb  = ex_wb_pipe_i.csr_en && (csr_waddr == CSR_MSCRATCHCSW);
   assign mscratchcswl_in_wb = ex_wb_pipe_i.csr_en && (csr_waddr == CSR_MSCRATCHCSWL);
   assign mnxti_in_wb        = ex_wb_pipe_i.csr_en && (csr_waddr == CSR_MNXTI);
 
   // Some signals are unused on purpose (typically they are used by RVFI code). Use them here for easier LINT waiving.
 
   assign unused_signals = mstatush_we | misa_we | mip_we | mvendorid_we |
-    marchid_we | mimpid_we | mhartid_we | mconfigptr_we | mtval_we | (|mnxti_n) | mscratchcsw_we | mscratchcswl_we |
-    (|mscratchcsw_rdata) | (|mscratchcswl_rdata) | (|mscratchcsw_n) | (|mscratchcswl_n) |
-    mscratchcsw_in_wb | mscratchcswl_in_wb | mnxti_in_wb |
+    marchid_we | mimpid_we | mhartid_we | mconfigptr_we | mtval_we | (|mnxti_n) | mscratchcswl_we |
+    (|mscratchcswl_rdata) | (|mscratchcswl_n) |mscratchcswl_in_wb | mnxti_in_wb |
     (|mtval_n) | (|mconfigptr_n) | (|mhartid_n) | (|mimpid_n) | (|marchid_n) | (|mvendorid_n) | (|mip_n) | (|misa_n) | (|mstatush_n);
 
 endmodule

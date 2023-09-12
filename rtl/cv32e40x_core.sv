@@ -240,9 +240,13 @@ module cv32e40x_core import cv32e40x_pkg::*;
   logic csr_wr_in_wb_flush;
   logic csr_irq_enable_write;
 
+  privlvl_t     priv_lvl_lsu;
+  privlvlctrl_t priv_lvl_if_ctrl;
+
   privlvl_t     priv_lvl;
 
   logic         csr_mnxti_read;
+  csr_hz_t      csr_hz;
 
   // CLIC signals for returning pointer addresses
   // when mnxti is accessed
@@ -322,14 +326,12 @@ module cv32e40x_core import cv32e40x_pkg::*;
   logic        sys_en_id;
   logic        sys_mret_insn_id;
   logic        csr_en_raw_id;
-  csr_opcode_e csr_op_id;
   logic        csr_illegal;
 
   // CSR illegal in EX due to offloading and pipeline accept
   logic        xif_csr_error_ex;
 
   // irq signals
-  // TODO:AB Should find a proper suffix for signals from interrupt_controller
   logic        irq_req_ctrl;
   logic [9:0]  irq_id_ctrl;
   logic        irq_wu_ctrl;
@@ -383,7 +385,8 @@ module cv32e40x_core import cv32e40x_pkg::*;
   assign m_c_obi_data_if.s_gnt.gnt           = data_gnt_i;
   assign m_c_obi_data_if.s_rvalid.rvalid     = data_rvalid_i;
   assign m_c_obi_data_if.resp_payload.rdata  = data_rdata_i;
-  assign m_c_obi_data_if.resp_payload.err    = data_err_i;
+  assign m_c_obi_data_if.resp_payload.err[0] = data_err_i;
+  assign m_c_obi_data_if.resp_payload.err[1] = 1'b0; // Will be assigned in the response filter
   assign m_c_obi_data_if.resp_payload.exokay = data_exokay_i;
 
   assign debug_havereset_o = ctrl_fsm.debug_havereset;
@@ -502,6 +505,9 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .if_valid_o          ( if_valid                 ),
     .id_ready_i          ( id_ready                 ),
 
+    // Privilege level
+    .priv_lvl_ctrl_i     ( priv_lvl_if_ctrl         ),
+
     // eXtension interface
     .xif_compressed_if   ( xif_compressed_if        ),
     .xif_offloading_id_i ( xif_offloading_id        )
@@ -559,7 +565,6 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .sys_mret_insn_o              ( sys_mret_insn_id          ),
     .csr_illegal_i                ( csr_illegal               ),
     .csr_en_raw_o                 ( csr_en_raw_id             ),
-    .csr_op_o                     ( csr_op_id                 ),
     .alu_en_o                     ( alu_en_id                 ),
     .sys_en_o                     ( sys_en_id                 ),
 
@@ -614,6 +619,7 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .csr_rdata_i                ( csr_rdata                    ),
     .csr_illegal_i              ( csr_illegal                  ),
     .csr_mnxti_read_i           ( csr_mnxti_read               ),
+    .csr_hz_i                   ( csr_hz                       ),
 
     // Branch decision
     .branch_decision_o          ( branch_decision_ex           ),
@@ -705,6 +711,9 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .lsu_wpt_match_1_o     ( lsu_wpt_match_wb   ),
     .lsu_align_status_1_o  ( lsu_align_status_wb),
     .lsu_atomic_1_o        ( lsu_atomic_wb      ),
+
+    // Privilege level
+    .priv_lvl_lsu_i        ( priv_lvl_lsu       ),
 
     // Valid/ready
     .valid_0_i             ( lsu_valid_ex       ), // First LSU stage (EX)
@@ -832,6 +841,8 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .mtvec_mode_o               ( mtvec_mode             ),
     .mtvt_addr_o                ( mtvt_addr              ),
 
+    .priv_lvl_if_ctrl_o         ( priv_lvl_if_ctrl       ),
+    .priv_lvl_lsu_o             ( priv_lvl_lsu           ),
     .priv_lvl_o                 ( priv_lvl               ),
 
     // ID/EX pipeline
@@ -848,6 +859,7 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .csr_counter_read_o         ( csr_counter_read       ),
     .csr_mnxti_read_o           ( csr_mnxti_read         ),
     .csr_irq_enable_write_o     ( csr_irq_enable_write   ),
+    .csr_hz_o                   ( csr_hz                 ),
 
     // Interface to CSRs (SRAM like)
     .csr_rdata_o                ( csr_rdata              ),
@@ -896,6 +908,7 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .REGFILE_NUM_READ_PORTS         ( REGFILE_NUM_READ_PORTS ),
     .CLIC                           ( CLIC                   ),
     .CLIC_ID_WIDTH                  ( CLIC_ID_WIDTH          ),
+    .RV32                           ( RV32                   ),
     .DEBUG                          ( DEBUG                  )
   )
   controller_i
@@ -940,7 +953,6 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .sys_en_id_i                    ( sys_en_id              ),
     .sys_mret_id_i                  ( sys_mret_insn_id       ),
     .csr_en_raw_id_i                ( csr_en_raw_id          ),
-    .csr_op_id_i                    ( csr_op_id              ),
     .first_op_id_i                  ( first_op_id            ),
 
     // LSU
@@ -970,6 +982,7 @@ module cv32e40x_core import cv32e40x_pkg::*;
     .mtvec_mode_i                   ( mtvec_mode             ),
     .mcause_i                       ( mcause                 ),
     .mintstatus_i                   ( mintstatus             ),
+    .csr_hz_i                       ( csr_hz                 ),
 
     // Trigger module
     .etrigger_wb_i                  ( etrigger_wb            ),

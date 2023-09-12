@@ -36,6 +36,7 @@ module cv32e40x_controller import cv32e40x_pkg::*;
   parameter int unsigned REGFILE_NUM_READ_PORTS = 2,
   parameter bit          CLIC                   = 0,
   parameter int unsigned CLIC_ID_WIDTH          = 5,
+  parameter rv32_e       RV32                   = RV32I,
   parameter bit          DEBUG                  = 1
 )
 (
@@ -59,7 +60,6 @@ module cv32e40x_controller import cv32e40x_pkg::*;
   input  logic        sys_en_id_i,
   input  logic        sys_mret_id_i,
   input  logic        csr_en_raw_id_i,
-  input  csr_opcode_e csr_op_id_i,
   input  logic        first_op_id_i,
   input  logic        last_op_id_i,
   input  logic        abort_op_id_i,
@@ -118,6 +118,7 @@ module cv32e40x_controller import cv32e40x_pkg::*;
   input  logic        csr_mnxti_read_i,           // MNXTI is read in CSR (EX)
 
   input  logic        csr_irq_enable_write_i,     // An interrupt may be enabled by a write (WB)
+  input  csr_hz_t     csr_hz_i,
 
   input logic [REGFILE_NUM_READ_PORTS-1:0] rf_re_id_i,
   input rf_addr_t     rf_raddr_id_i[REGFILE_NUM_READ_PORTS],
@@ -151,6 +152,7 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .X_EXT                       ( X_EXT                    ),
     .CLIC                        ( CLIC                     ),
     .CLIC_ID_WIDTH               ( CLIC_ID_WIDTH            ),
+    .RV32                        ( RV32                     ),
     .DEBUG                       ( DEBUG                    )
   )
   controller_fsm_i
@@ -262,7 +264,6 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .alu_jmpr_id_i              ( alu_jmpr_id_i            ),
     .sys_mret_id_i              ( sys_mret_id_i            ),
     .csr_en_raw_id_i            ( csr_en_raw_id_i          ),
-    .csr_op_id_i                ( csr_op_id_i              ),
 
     // From EX
     .csr_counter_read_i         ( csr_counter_read_i       ),
@@ -276,6 +277,8 @@ module cv32e40x_controller import cv32e40x_pkg::*;
     .lsu_atomic_ex_i            ( lsu_atomic_ex_i          ),
     .lsu_atomic_wb_i            ( lsu_atomic_wb_i          ),
     .lsu_bus_busy_i             ( lsu_bus_busy_i           ),
+
+    .csr_hz_i                   ( csr_hz_i                 ),
 
     // Outputs
     .ctrl_byp_o                 ( ctrl_byp_o               )

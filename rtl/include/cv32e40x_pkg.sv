@@ -62,8 +62,6 @@ package cv32e40x_pkg;
 
 parameter ALU_OP_WIDTH = 6;
 
-  // TODO:low Could a smarter encoding be used here?
-
 // Note: Certain bits in alu_opcode_e are referred to directly in the ALU:
 //
 // - Bit 2: Right shift?
@@ -89,7 +87,6 @@ typedef enum logic [ALU_OP_WIDTH-1:0]
  ALU_B_ORN    = 6'b101110, // funct3 = 110, zbb
  ALU_B_ANDN   = 6'b101111, // funct3 = 111, zbb
 
- // Comparisons // todo: comparator operators do not need to be part of ALU operators
  ALU_EQ       = 6'b010000, // funct3 = 000
  ALU_NE       = 6'b010001, // funct3 = 001
  ALU_SLT      = 6'b011010, // funct3 = 010, signed(3)
@@ -266,7 +263,6 @@ typedef enum logic[11:0] {
   CSR_MIP            = 12'h344,
   CSR_MNXTI          = 12'h345,
   CSR_MINTTHRESH     = 12'h347,
-  CSR_MSCRATCHCSW    = 12'h348,
   CSR_MSCRATCHCSWL   = 12'h349,
   CSR_MCLICBASE      = 12'h34A,
 
@@ -471,6 +467,12 @@ typedef enum logic[1:0] {
 } privlvl_t;
 
 parameter privlvl_t PRIV_LVL_LOWEST = PRIV_LVL_M;
+
+// Struct used for setting privilege level
+typedef struct packed {
+  logic        priv_lvl_set;
+  privlvl_t    priv_lvl;
+} privlvlctrl_t;
 
 // Machine Vendor ID - OpenHW JEDEC ID is '2 decimal (bank 13)'
 parameter MVENDORID_OFFSET = 7'h2;      // Final byte without parity bit
@@ -720,6 +722,16 @@ parameter logic [31:0] TDATA1_RST_VAL = {
   parameter TDATA1_TTYPE_HIGH = 31;
   parameter TDATA1_TTYPE_LOW  = 28;
 
+  // Struct for carrying read/write hazard signals
+  typedef struct packed {
+    logic impl_re_ex; // Implicit CSR read in EX
+    logic impl_wr_ex; // Implicit CSR write in EX (will perform write in WB)
+    logic expl_re_ex; // Conservative, using flopped instr_valid
+    logic expl_we_wb; // Conservative, using flopped instr_valid
+    csr_num_e expl_raddr_ex;
+    csr_num_e expl_waddr_wb;
+  } csr_hz_t;
+
 
 ///////////////////////////////////////////////
 //   ___ ____    ____  _                     //
@@ -934,10 +946,6 @@ parameter EXC_CAUSE_STORE_FAULT      = 11'h07;
 parameter EXC_CAUSE_ECALL_MMODE      = 11'h0B;
 parameter EXC_CAUSE_INSTR_BUS_FAULT  = 11'h18;
 
-parameter logic [31:0] ETRIGGER_TDATA2_MASK = (1 << EXC_CAUSE_INSTR_BUS_FAULT) | (1 << EXC_CAUSE_ECALL_MMODE) | (1 << EXC_CAUSE_STORE_FAULT) |
-                                              (1 << EXC_CAUSE_LOAD_FAULT) | (1 << EXC_CAUSE_BREAKPOINT) | (1 << EXC_CAUSE_ILLEGAL_INSN) | (1 << EXC_CAUSE_INSTR_FAULT) |
-                                              (1 << EXC_CAUSE_LOAD_MISALIGNED) | (1<<EXC_CAUSE_STORE_MISALIGNED);
-
 parameter INT_CAUSE_LSU_LOAD_FAULT  = 11'h400;
 parameter INT_CAUSE_LSU_STORE_FAULT = 11'h401;
 
@@ -1053,7 +1061,7 @@ typedef struct packed {
 
 typedef struct packed {
   logic [DATA_DATA_WIDTH-1:0] rdata;
-  logic                       err;
+  logic [1:0]                 err; // bit0: Error from bus, bit1: 0 for load, 1 for store
   logic                       exokay;
 } obi_data_resp_t;
 
@@ -1106,7 +1114,6 @@ typedef struct packed {
 } outstanding_t;
 
 // Instruction meta data
-// TODO: consider moving other instruction meta data to this struct. e.g. xxx_insn, pc, etc (but don't move stuff here that is specific to one functional unit)
 typedef struct packed
 {
   logic        compressed;
@@ -1276,6 +1283,8 @@ typedef struct packed {
   logic         first_op;         // First part of multi operation instruction
   logic         last_op;          // Last part of multi operation instruction
   logic         abort_op;         // Instruction will be aborted due to known exceptions or trigger matches
+
+  logic         csr_impl_wr;      // A CSR instruction is doing an implicit write
 } ex_wb_pipe_t;
 
 // Performance counter events
@@ -1305,7 +1314,8 @@ typedef struct packed {
   jalr_fw_mux_e jalr_fw_mux_sel;        // Jump target forward mux sel
   logic         jalr_stall;             // Stall due to JALR hazard (JALR used result from EX or LSU result in WB)
   logic         load_stall;             // Stall due to load operation
-  logic         csr_stall;
+  logic         csr_stall_id;
+  logic         csr_stall_ex;
   logic         sleep_stall;            // Stall ID due to sleep (e.g. WFI, WFE) instruction in EX
   logic         mnxti_id_stall;         // Stall ID due to mnxti CSR access in EX
   logic         mnxti_ex_stall;         // Stall EX due to LSU instruction in WB
@@ -1366,7 +1376,6 @@ typedef struct packed {
   logic        csr_restore_mret_ptr; // Restore CSR due to mret followed by CLIC
   logic        csr_restore_dret;    // Restore CSR due to dret
   logic        csr_save_cause;      // Update CSRs
-  logic        csr_clear_minhv;     // Clear the mcause.minhv field
   logic        pending_nmi;         // An NMI is pending (for dcsr.nmip)
 
   // Performance counter events

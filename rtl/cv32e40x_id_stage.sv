@@ -76,7 +76,6 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
 
   input  logic        csr_illegal_i,
   output logic        csr_en_raw_o,
-  output csr_opcode_e csr_op_o,
 
   output logic        alu_en_o,
   output logic        sys_en_o,
@@ -494,7 +493,7 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
       id_ex_pipe_o.alu_bch                <= 1'b0;
       id_ex_pipe_o.alu_jmp                <= 1'b0;
       id_ex_pipe_o.alu_operator           <= ALU_SLTU;
-      id_ex_pipe_o.alu_operand_a          <= 32'b0; // todo: path from data_rdata_i through WB to id_ex_pipe_o_reg_alu_operand_a seems longer than needed (too many gates in ID)
+      id_ex_pipe_o.alu_operand_a          <= 32'b0;
       id_ex_pipe_o.alu_operand_b          <= 32'b0;
 
       id_ex_pipe_o.operand_c              <= 32'b0;
@@ -659,7 +658,6 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   assign alu_jmpr_o   = alu_jmpr;
 
   assign csr_en_raw_o = csr_en_raw;
-  assign csr_op_o = csr_op;
 
   assign alu_en_o     = alu_en;
   assign sys_en_o     = sys_en;
@@ -673,11 +671,11 @@ module cv32e40x_id_stage import cv32e40x_pkg::*;
   assign id_valid_o = (instr_valid && !xif_waiting);
 
   assign first_op_o  = if_id_pipe_i.first_op;
-  // An mret with mcause.minhv set and mcause.mpp = PRIV_LVL_M will cause a pointer fetch, and that pointer fetch is the last operation of the mret.
+  // An mret with mcause.minhv set  will cause a pointer fetch, and that pointer fetch is the last operation of the mret.
   // Mrets with the mcause conditions not true will be normal single operation instructions.
-  // Using CSR signals below is safe, as any implicit or explicit CSR read in ID stage is halted if there is an implicit or explicit CSR write
+  // Using CSR signals below is safe, as any implicit CSR read in ID stage is halted if there is an implicit or explicit CSR write
   // in either EX or WB at the same time.
-  assign last_op_o   = (sys_en && sys_mret_insn && mcause_i.minhv && (mcause_i.mpp == PRIV_LVL_M)) ? 1'b0 : if_id_pipe_i.last_op;
+  assign last_op_o   = (sys_en && sys_mret_insn && mcause_i.minhv) ? 1'b0 : if_id_pipe_i.last_op;
   assign abort_op_o  = if_id_pipe_i.abort_op || ctrl_byp_i.id_stage_abort;
   //---------------------------------------------------------------------------
   // eXtension interface

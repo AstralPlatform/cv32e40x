@@ -81,6 +81,9 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
   output logic          if_valid_o,
   input  logic          id_ready_i,
 
+  // Privilege mode
+  input privlvlctrl_t   priv_lvl_ctrl_i,
+
   // eXtension interface
   cv32e40x_if_xif.cpu_compressed xif_compressed_if,      // XIF compressed interface
   input  logic                   xif_offloading_id_i     // ID stage attempts to offload an instruction
@@ -200,6 +203,7 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
     .rst_n                    ( rst_n                       ),
 
     .ctrl_fsm_i               ( ctrl_fsm_i                  ),
+    .priv_lvl_ctrl_i          ( priv_lvl_ctrl_i             ),
 
     .branch_addr_i            ( {branch_addr_n[31:1], 1'b0} ),
 
@@ -257,6 +261,7 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
                                                            // Misaligned access to main is allowed, and accesses outside main will
                                                            // result in instruction access fault (which will have priority over
                                                            //  misaligned from I/O fault)
+    .modified_access_i    ( 1'b0                        ), // Prefetcher will never issue a modified request
     .core_one_txn_pend_n  ( prefetch_one_txn_pend_n     ),
     .core_mpu_err_wait_i  ( 1'b1                        ),
     .core_mpu_err_o       (                             ), // Unconnected on purpose
@@ -362,7 +367,6 @@ module cv32e40x_if_stage import cv32e40x_pkg::*;
   end
 
   // IF-ID pipeline registers, frozen when the ID stage is stalled
-  // Todo: E40S: We will probably need to prevent dummy instructions between pointer fetcher and the pointer target fetch
   always_ff @(posedge clk, negedge rst_n)
   begin : IF_ID_PIPE_REGISTERS
     if (rst_n == 1'b0) begin
